@@ -1,0 +1,375 @@
+<!doctype html>
+<!--
+  ClimbWall - Custom Google Cast Web Receiver.
+
+  Register THIS page's public HTTPS URL as your receiver's "Receiver Application URL" in the
+  Google Cast SDK Developer Console (the console then gives you the App ID that goes into
+  frontend/src/cast.js). Vite copies frontend/public/ into the build, so once the app is deployed
+  this is served at  https://<your-host>/receiver.html .
+
+  What it does: listens for JSON state messages from the phone on the CAST_NAMESPACE channel and
+  draws the wall as an SVG (normalized 0-1 space, same idea as CastView.jsx). The phone no longer
+  pushes images - it sends state, and the animations below run locally on the TV.
+
+  Messages (see frontend/src/cast.js / useCast.js):
+    { state: "markers", markers: [[x,y] x4] }          calibration markers
+    { state: "idle",  holds: [...], calibrated, wall_outline, image_url?, image_width?, image_height? }
+    { state: "route", holds: [...], route_holds: [{hold_id, role, polygon}], ...same extras }
+    { state: "geometry", holds: [...], append: bool }  preload polygons only (used when the full
+                                                       message would exceed Cast's ~64KB limit;
+                                                       a following idle/route message may then
+                                                       omit `holds` and reuse the cached shapes)
+    { state: "blank" }                                 everything off
+  A hold is { hold_id, polygon: [[x,y],...], role? }.
+
+  Why the DOM is structured the way it is (so state swaps animate instead of snapping):
+    * Each hold is a <g> with TWO pulse layers - an "idle" (white, slow breathe) and a "route"
+      (role colour, faster pulse). Both layers' pulses run forever; a state change only
+      transitions each layer's wrapper opacity. Nothing ever starts/stops/swaps a keyframe
+      animation on a visible element, which is what causes visible jumps.
+    * Holds are keyed by hold_id and reused between messages, so CSS transitions have a
+      previous value to transition from. Newly created holds are committed hidden first
+      (forced reflow) so their first fade-in actually animates.
+
+  Local testing without a Chromecast: open  receiver.html?dev=1  in Chrome and call
+  climbReceiver.apply({...}) from the console (no Cast SDK needed).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ClimbWall</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    /* Timing knobs - tweak the whole feel here. */
+    --fade-in: 0.9s;          /* a layer lighting up */
+    --fade-out: 1.1s;         /* a layer going dark */
+    --light-delay: 0.35s;     /* lights come on this long after the old ones start leaving */
+    --idle-period: 3.8s;      /* one idle "breath" */
+    --route-period: 1.5s;     /* one route pulse (faster/stronger than idle) */
+  }
+
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 0; padding: 18px 24px; text-align: center;
+    font: 22px/1.3 system-ui, sans-serif; color: #a3abbb; transition: opacity 0.8s;
+  }
+  #hint.gone { opacity: 0; pointer-events: none; }
+
+  /* ---- simple fading layers: wall photo (uncalibrated fallback), wall outline, markers ---- */
+  .fade { opacity: 0; transition: opacity 0.7s ease; }
+  .fade.on { opacity: 1; }
+  #outline { fill: none; stroke: #5a5a64; stroke-width: 2; vector-effect: non-scaling-stroke; }
+
+  .marker-dot { fill: #fff; }
+  .marker-label { fill: #fff; font: 700 0.03px sans-serif; text-anchor: middle; dominant-baseline: middle; }
+
+  /* ---- holds ---- */
+  .hold { transform-box: fill-box; transform-origin: center; }
+  .hold .layer { opacity: 0; }
+
+  /* Going dark: ease-IN, so a leaving hold stays bright for the first moments (which is what
+     makes the "pulse away" swell below readable) and then drops. Applies to the layer whenever
+     it is NOT the active one, because transitions use the destination state's settings. */
+  .hold .layer { transition: opacity var(--fade-out) cubic-bezier(0.5, 0, 1, 1); }
+
+  /* Lighting up: ease-OUT with a delay, so on idle<->route swaps the old holds start leaving
+     first and the new ones come in right behind them. Idle also staggers per hold (--stagger)
+     so the wall washes on rather than flipping on as one block; route holds light together. */
+  .hold.is-idle  .idle-layer  { opacity: 1; transition: opacity var(--fade-in) ease-out calc(var(--light-delay) + var(--stagger, 0s)); }
+  .hold.is-route .route-layer { opacity: 1; transition: opacity var(--fade-in) ease-out var(--light-delay); }
+
+  .pulse {
+    vector-effect: non-scaling-stroke; stroke-linejoin: round;
+    animation-iteration-count: infinite; animation-timing-function: ease-in-out;
+    animation-play-state: paused;                  /* hidden layers don't burn the TV's CPU */
+    transition: fill 0.5s, stroke 0.5s;            /* role changes cross-fade colour */
+  }
+  .hold.is-idle  .idle-layer  .pulse,
+  .hold.is-route .route-layer .pulse { animation-play-state: running; }
+
+  .idle-layer .pulse {
+    fill: rgba(255, 255, 255, 0.30); stroke: #fff; stroke-width: 3;
+    animation-name: idle-breathe; animation-duration: var(--idle-period);
+    /* --r is a random 0-1 set per hold in JS: de-syncs the breathing so the wall shimmers. */
+    animation-delay: calc(var(--r, 0) * var(--idle-period) * -1);
+  }
+  .route-layer .pulse {
+    fill: var(--fill, rgba(242, 194, 48, 0.45)); stroke: var(--c, #f2c230); stroke-width: 5;
+    animation-name: route-pulse; animation-duration: var(--route-period);
+  }
+
+  /* Never fully dim: "stay lit" is the point of idle. */
+  @keyframes idle-breathe { 0%, 100% { opacity: 0.70; } 50% { opacity: 1; } }
+  @keyframes route-pulse  { 0%, 100% { opacity: 0.50; } 50% { opacity: 1; } }
+
+  /* Role colours - mirror styles.css (.hold.route.role-*) and cast_render.ROLE_COLORS. */
+  .role-start { --c: #7ed957; --fill: rgba(126, 217, 87, 0.45); }
+  .role-hold  { --c: #f2c230; --fill: rgba(242, 194, 48, 0.45); }
+  .role-foot  { --c: #7fd6ff; --fill: rgba(127, 214, 255, 0.45); }
+  .role-end   { --c: #ff6ec7; --fill: rgba(255, 110, 199, 0.45); }
+
+  /* One-shot "pulse away" for holds that were lit and are being switched off: swell, then settle
+     back to scale(1) (start == end, so removing the class afterwards can't cause a jump) while
+     the layer's own ease-in fade-out above carries it to dark. */
+  .hold.pulse-away { animation: pulse-away 1.2s ease-in-out; }
+  @keyframes pulse-away {
+    0%   { transform: scale(1); }
+    30%  { transform: scale(1.4); }
+    100% { transform: scale(1); }
+  }
+</style>
+</head>
+<body>
+<svg id="stage" viewBox="0 0 1 1" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+  <image id="photo" class="fade" x="0" y="0" width="1" height="1" preserveAspectRatio="none"/>
+  <g id="wall">
+    <polygon id="outline" class="fade"/>
+    <!-- hold <g>s are appended here by JS -->
+  </g>
+  <g id="markers" class="fade"></g>
+</svg>
+<p id="hint">ClimbWall — waiting for your phone…</p>
+
+<script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<script>
+(() => {
+  // Must match CAST_NAMESPACE in frontend/src/cast.js.
+  const CAST_NAMESPACE = "urn:x-cast:com.climbwall.projector";
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const DEFAULT_MARKERS = [[0.05, 0.05], [0.95, 0.05], [0.95, 0.95], [0.05, 0.95]];
+  const ROLES = ["start", "hold", "foot", "end"];
+  const REMOVE_AFTER_MS = 2500; // let a retired hold finish fading before dropping its DOM
+
+  const $ = (id) => document.getElementById(id);
+  const stage = $("stage"), photo = $("photo"), wall = $("wall"), outline = $("outline");
+  const markersLayer = $("markers"), hint = $("hint");
+
+  const holds = new Map();   // hold_id -> { id, el, idle, route, mode, role, points, removeTimer }
+  let geo = new Map();       // hold_id -> polygon; last full set of shapes (see "geometry" state)
+  let markersKey = "";
+
+  function svg(tag, attrs = {}) {
+    const el = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    return el;
+  }
+  const pts = (poly) => poly.map((p) => `${p[0]},${p[1]}`).join(" ");
+  const commit = () => void stage.getBoundingClientRect(); // force style/layout flush
+
+  // ---------- holds ----------
+  function createHold(id) {
+    const el = svg("g", { class: "hold" });
+    const layer = (cls) => {
+      const g = svg("g", { class: `layer ${cls}` });
+      const poly = svg("polygon", { class: "pulse" });
+      g.appendChild(poly);
+      el.appendChild(g);
+      return poly;
+    };
+    const h = { id, el, idle: layer("idle-layer"), route: layer("route-layer"),
+                mode: null, role: null, points: "", removeTimer: null };
+    el.style.setProperty("--r", Math.random().toFixed(3));          // idle breathing phase
+    el.style.setProperty("--stagger", (Math.random() * 0.8).toFixed(2) + "s"); // wash-on delay
+    el.addEventListener("animationend", (e) => {
+      if (e.target === el) el.classList.remove("pulse-away");
+    });
+    wall.appendChild(el);
+    holds.set(id, h);
+    return h;
+  }
+
+  function setPoints(h, poly) {
+    const s = pts(poly);
+    if (s === h.points) return;
+    h.points = s;
+    h.idle.setAttribute("points", s);
+    h.route.setAttribute("points", s);
+  }
+
+  /** mode: "idle" | "route" | "off". `quiet` skips the pulse-away swell (used for hard hides). */
+  function setMode(h, mode, role, quiet = false) {
+    const wantRole = mode === "route" && ROLES.includes(role) ? role : null;
+    if (wantRole !== h.role) {
+      if (h.role) h.el.classList.remove(`role-${h.role}`);
+      if (wantRole) h.el.classList.add(`role-${wantRole}`);
+      h.role = wantRole;
+    }
+    if (mode === h.mode) return;
+    const prev = h.mode;
+    h.el.classList.remove("is-idle", "is-route", "is-off");
+    h.el.classList.add(`is-${mode}`);
+    if (mode === "route") {
+      // Re-phase so every route hold pulses in unison (they're invisible right now, so no pop).
+      h.route.getAnimations?.().forEach((a) => { a.currentTime = 0; });
+    }
+    if (mode === "off" && !quiet && (prev === "idle" || prev === "route")) {
+      h.el.classList.remove("pulse-away");
+      void h.el.getBoundingClientRect(); // restart the one-shot if it was mid-run
+      h.el.classList.add("pulse-away");
+    }
+    h.mode = mode;
+  }
+
+  function retire(h) {
+    setMode(h, "off");
+    if (h.removeTimer) return;
+    h.removeTimer = setTimeout(() => { h.el.remove(); holds.delete(h.id); }, REMOVE_AFTER_MS);
+  }
+
+  // ---------- states ----------
+  function setStageSpace(aspect) {
+    // Calibrated: projector output space, stretched to fill the screen (same as CastView).
+    // Uncalibrated fallback: wall photo letterboxed at its own aspect, holds drawn over it.
+    if (aspect) {
+      stage.setAttribute("viewBox", `0 0 ${aspect} 1`);
+      stage.setAttribute("preserveAspectRatio", "xMidYMid meet");
+      photo.setAttribute("width", aspect);
+      wall.setAttribute("transform", `scale(${aspect} 1)`);
+    } else {
+      stage.setAttribute("viewBox", "0 0 1 1");
+      stage.setAttribute("preserveAspectRatio", "none");
+      wall.removeAttribute("transform");
+    }
+  }
+
+  function showWall(msg) {
+    const routeMode = msg.state === "route";
+
+    // All holds: this message's `holds`, or the cached shapes if it omitted them.
+    let all;
+    if (Array.isArray(msg.holds)) {
+      all = new Map();
+      for (const h of msg.holds) {
+        const poly = h.polygon || geo.get(h.hold_id);
+        if (poly) all.set(h.hold_id, poly);
+      }
+      geo = new Map(all);
+    } else {
+      all = new Map(geo);
+    }
+    const roles = new Map();
+    if (routeMode) {
+      for (const rh of msg.route_holds || []) {
+        const poly = rh.polygon || all.get(rh.hold_id) || geo.get(rh.hold_id);
+        if (!poly) continue;
+        roles.set(rh.hold_id, rh.role);
+        all.set(rh.hold_id, poly);
+      }
+    }
+
+    // Space / backdrop.
+    const calibrated = msg.calibrated !== false;
+    const hasPhoto = !calibrated && msg.image_url && msg.image_width && msg.image_height;
+    if (hasPhoto) {
+      const aspect = msg.image_width / msg.image_height;
+      setStageSpace(aspect);
+      if (photo.getAttribute("href") !== msg.image_url) photo.setAttribute("href", msg.image_url);
+      photo.classList.add("on");
+    } else {
+      setStageSpace(null);
+      photo.classList.remove("on");
+    }
+    if (calibrated && Array.isArray(msg.wall_outline) && msg.wall_outline.length > 2) {
+      outline.setAttribute("points", pts(msg.wall_outline));
+      outline.classList.add("on");
+    } else {
+      outline.classList.remove("on");
+    }
+
+    // Create / reuse holds. Commit new ones hidden before changing their mode so the first
+    // fade-in has a "from" value to transition from.
+    let created = false;
+    for (const [id, poly] of all) {
+      let h = holds.get(id);
+      if (!h) { h = createHold(id); created = true; }
+      if (h.removeTimer) { clearTimeout(h.removeTimer); h.removeTimer = null; }
+      setPoints(h, poly);
+    }
+    if (created) commit();
+
+    for (const [id, h] of holds) {
+      if (!all.has(id)) { retire(h); continue; }
+      const mode = !routeMode ? "idle" : roles.has(id) ? "route" : "off";
+      setMode(h, mode, roles.get(id));
+    }
+    markersLayer.classList.remove("on");
+  }
+
+  function showMarkers(msg) {
+    setStageSpace(null);
+    photo.classList.remove("on");
+    outline.classList.remove("on");
+    for (const h of holds.values()) setMode(h, "off", null, true);
+
+    const list = Array.isArray(msg.markers) && msg.markers.length ? msg.markers : DEFAULT_MARKERS;
+    const key = JSON.stringify(list);
+    if (key !== markersKey) {
+      markersKey = key;
+      markersLayer.replaceChildren();
+      list.forEach(([x, y], i) => {
+        markersLayer.appendChild(svg("circle", { cx: x, cy: y, r: 0.02, class: "marker-dot" }));
+        const t = svg("text", { x, y: y - 0.035, class: "marker-label" });
+        t.textContent = String(i + 1);
+        markersLayer.appendChild(t);
+      });
+    }
+    markersLayer.classList.add("on");
+  }
+
+  function blank() {
+    for (const h of holds.values()) setMode(h, "off", null, true);
+    photo.classList.remove("on");
+    outline.classList.remove("on");
+    markersLayer.classList.remove("on");
+  }
+
+  function loadGeometry(msg) {
+    if (!msg.append) geo = new Map();
+    for (const h of msg.holds || []) if (h.polygon) geo.set(h.hold_id, h.polygon);
+  }
+
+  function apply(msg) {
+    switch (msg.state) {
+      case "geometry": loadGeometry(msg); return;       // no visual change by itself
+      case "markers": hint.classList.add("gone"); showMarkers(msg); return;
+      case "idle":
+      case "route": hint.classList.add("gone"); showWall(msg); return;
+      case "blank": hint.classList.add("gone"); blank(); return;
+      default: console.warn("ClimbWall receiver: unknown state", msg.state);
+    }
+  }
+
+  function onMessage(event) {
+    let msg = event.data;
+    if (typeof msg === "string") { try { msg = JSON.parse(msg); } catch { return; } }
+    if (!msg || typeof msg !== "object") return;
+    try { apply(msg); } catch (e) { console.error("ClimbWall receiver: bad message", e, msg); }
+  }
+
+  window.climbReceiver = { apply };
+
+  // ---------- Cast wiring ----------
+  const dev = new URLSearchParams(location.search).has("dev");
+  if (dev || !window.cast?.framework) {
+    // Not running on a Chromecast (or ?dev=1): drive it by hand from the console.
+    console.info("ClimbWall receiver in dev mode - call climbReceiver.apply({state: ...})");
+    return;
+  }
+  const ctx = cast.framework.CastReceiverContext.getInstance();
+  ctx.addCustomMessageListener(CAST_NAMESPACE, onMessage);
+  // Phone pressed "Disconnect": stop the app so the TV goes back to its home screen.
+  ctx.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, (e) => {
+    if (ctx.getSenders().length === 0 &&
+        e.reason === cast.framework.system.DisconnectReason.REQUESTED_BY_SENDER) ctx.stop();
+  });
+  const options = new cast.framework.CastReceiverOptions();
+  options.disableIdleTimeout = true; // no media is ever loaded; don't let the idle timer kill us
+  options.customNamespaces = { [CAST_NAMESPACE]: cast.framework.system.MessageType.JSON };
+  ctx.start(options);
+})();
+</script>
+</body>
+</html>
