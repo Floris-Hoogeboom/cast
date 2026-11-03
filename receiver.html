@@ -50,7 +50,6 @@
   }
 
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
-  #stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
 
   #hint {
     position: fixed; left: 0; right: 0; bottom: 0; padding: 18px 24px; text-align: center;
@@ -66,44 +65,34 @@
   .marker-dot { fill: #fff; }
   .marker-label { fill: #fff; font: 700 0.03px sans-serif; text-anchor: middle; dominant-baseline: middle; }
 
-  /* ---- holds ---- */
-  .hold { transform-box: fill-box; transform-origin: center; }
-  .hold .layer { opacity: 0; }
-
-  /* Going dark: ease-IN, so a leaving hold stays bright for the first moments (which is what
-     makes the "pulse away" swell below readable) and then drops. Applies to the layer whenever
-     it is NOT the active one, because transitions use the destination state's settings. */
-  .hold .layer { transition: opacity var(--fade-out) cubic-bezier(0.5, 0, 1, 1); }
-
-  /* Lighting up: ease-OUT with a delay, so on idle<->route swaps the old holds start leaving
-     first and the new ones come in right behind them. Idle also staggers per hold (--stagger)
-     so the wall washes on rather than flipping on as one block; route holds light together. */
-  .hold.is-idle  .idle-layer  { opacity: 1; transition: opacity var(--fade-in) ease-out calc(var(--light-delay) + var(--stagger, 0s)); }
-  .hold.is-route .route-layer { opacity: 1; transition: opacity var(--fade-in) ease-out var(--light-delay); }
-
-  .pulse {
-    vector-effect: non-scaling-stroke; stroke-linejoin: round;
-    animation-iteration-count: infinite; animation-timing-function: ease-in-out;
-    animation-play-state: paused;                  /* hidden layers don't burn the TV's CPU */
-    transition: fill 0.5s, stroke 0.5s;            /* role changes cross-fade colour */
-  }
-  .hold.is-idle  .idle-layer  .pulse,
-  .hold.is-route .route-layer .pulse { animation-play-state: running; }
-
-  .idle-layer .pulse {
-    fill: rgba(255, 255, 255, 0.30); stroke: #fff; stroke-width: 3;
-    animation-name: idle-breathe; animation-duration: var(--idle-period);
-    /* --r is a random 0-1 set per hold in JS: de-syncs the breathing so the wall shimmers. */
-    animation-delay: calc(var(--r, 0) * var(--idle-period) * -1);
-  }
-  .route-layer .pulse {
-    fill: var(--fill, rgba(242, 194, 48, 0.45)); stroke: var(--c, #f2c230); stroke-width: 5;
-    animation-name: route-pulse; animation-duration: var(--route-period);
-  }
-
+  /* ---- holds ----
+     Performance note (Chromecast v3 is weak): the continuous pulse runs on TWO whole-layer <svg>
+     elements (#idle-svg / #route-svg) as a compositor-only opacity animation - not on every
+     polygon. Per-hold polygons only ever TRANSITION opacity (a ~1s fade when state changes),
+     so a static wall costs almost nothing to display. */
+  .stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #idle-svg  { animation: idle-breathe var(--idle-period) ease-in-out infinite; will-change: opacity; }
+  #route-svg { animation: route-pulse  var(--route-period) ease-in-out infinite; will-change: opacity; }
   /* Never fully dim: "stay lit" is the point of idle. */
   @keyframes idle-breathe { 0%, 100% { opacity: 0.70; } 50% { opacity: 1; } }
   @keyframes route-pulse  { 0%, 100% { opacity: 0.50; } 50% { opacity: 1; } }
+
+  .poly {
+    opacity: 0; vector-effect: non-scaling-stroke; stroke-linejoin: round;
+    transform-box: fill-box; transform-origin: center;
+    /* Going dark: ease-IN, so a leaving hold stays bright for the first moments (which is what
+       makes the "pulse away" swell readable) and then drops. */
+    transition: opacity var(--fade-out) cubic-bezier(0.5, 0, 1, 1), fill 0.5s, stroke 0.5s;
+  }
+  /* Lighting up: ease-OUT with a delay, so on idle<->route swaps the old holds start leaving
+     first and the new ones come in right behind them. Idle also staggers per hold (--stagger)
+     so the wall washes on instead of flipping on as one block; route holds light together. */
+  .poly.lit {
+    opacity: 1;
+    transition: opacity var(--fade-in) ease-out calc(var(--light-delay) + var(--stagger, 0s)), fill 0.5s, stroke 0.5s;
+  }
+  .idle-poly  { fill: rgba(255, 255, 255, 0.30); stroke: #fff; stroke-width: 3; }
+  .route-poly { fill: var(--fill, rgba(242, 194, 48, 0.45)); stroke: var(--c, #f2c230); stroke-width: 5; }
 
   /* Role colours - mirror styles.css (.hold.route.role-*) and cast_render.ROLE_COLORS. */
   .role-start { --c: #7ed957; --fill: rgba(126, 217, 87, 0.45); }
@@ -113,8 +102,8 @@
 
   /* One-shot "pulse away" for holds that were lit and are being switched off: swell, then settle
      back to scale(1) (start == end, so removing the class afterwards can't cause a jump) while
-     the layer's own ease-in fade-out above carries it to dark. */
-  .hold.pulse-away { animation: pulse-away 1.2s ease-in-out; }
+     the polygon's own ease-in fade-out carries it to dark. */
+  .idle-poly.pulse-away { animation: pulse-away 1.2s ease-in-out; }
   @keyframes pulse-away {
     0%   { transform: scale(1); }
     30%  { transform: scale(1.4); }
@@ -123,13 +112,19 @@
 </style>
 </head>
 <body>
-<svg id="stage" viewBox="0 0 1 1" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+<!-- Three stacked SVGs sharing one coordinate space (see setStageSpace). -->
+<svg id="stage" class="stage" viewBox="0 0 1 1" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
   <image id="photo" class="fade" x="0" y="0" width="1" height="1" preserveAspectRatio="none"/>
-  <g id="wall">
+  <g class="space">
     <polygon id="outline" class="fade"/>
-    <!-- hold <g>s are appended here by JS -->
   </g>
   <g id="markers" class="fade"></g>
+</svg>
+<svg id="idle-svg" class="stage" viewBox="0 0 1 1" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+  <g id="idle-space" class="space"></g>
+</svg>
+<svg id="route-svg" class="stage" viewBox="0 0 1 1" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+  <g id="route-space" class="space"></g>
 </svg>
 <p id="hint">ClimbWall — waiting for your phone…</p>
 
@@ -144,7 +139,8 @@
   const REMOVE_AFTER_MS = 2500; // let a retired hold finish fading before dropping its DOM
 
   const $ = (id) => document.getElementById(id);
-  const stage = $("stage"), photo = $("photo"), wall = $("wall"), outline = $("outline");
+  const stage = $("stage"), photo = $("photo"), outline = $("outline");
+  const idleSpace = $("idle-space"), routeSpace = $("route-space");
   const markersLayer = $("markers"), hint = $("hint");
 
   const holds = new Map();   // hold_id -> { id, el, idle, route, mode, role, points, removeTimer }
@@ -161,22 +157,13 @@
 
   // ---------- holds ----------
   function createHold(id) {
-    const el = svg("g", { class: "hold" });
-    const layer = (cls) => {
-      const g = svg("g", { class: `layer ${cls}` });
-      const poly = svg("polygon", { class: "pulse" });
-      g.appendChild(poly);
-      el.appendChild(g);
-      return poly;
-    };
-    const h = { id, el, idle: layer("idle-layer"), route: layer("route-layer"),
-                mode: null, role: null, points: "", removeTimer: null };
-    el.style.setProperty("--r", Math.random().toFixed(3));          // idle breathing phase
-    el.style.setProperty("--stagger", (Math.random() * 0.8).toFixed(2) + "s"); // wash-on delay
-    el.addEventListener("animationend", (e) => {
-      if (e.target === el) el.classList.remove("pulse-away");
-    });
-    wall.appendChild(el);
+    const idle = svg("polygon", { class: "poly idle-poly" });
+    const route = svg("polygon", { class: "poly route-poly" });
+    idle.style.setProperty("--stagger", (Math.random() * 0.8).toFixed(2) + "s"); // wash-on delay
+    idle.addEventListener("animationend", () => idle.classList.remove("pulse-away"));
+    idleSpace.appendChild(idle);
+    routeSpace.appendChild(route);
+    const h = { id, idle, route, mode: null, role: null, points: "", removeTimer: null };
     holds.set(id, h);
     return h;
   }
@@ -193,22 +180,21 @@
   function setMode(h, mode, role, quiet = false) {
     const wantRole = mode === "route" && ROLES.includes(role) ? role : null;
     if (wantRole !== h.role) {
-      if (h.role) h.el.classList.remove(`role-${h.role}`);
-      if (wantRole) h.el.classList.add(`role-${wantRole}`);
+      if (h.role) h.route.classList.remove(`role-${h.role}`);
+      if (wantRole) h.route.classList.add(`role-${wantRole}`);
       h.role = wantRole;
     }
     if (mode === h.mode) return;
     const prev = h.mode;
-    h.el.classList.remove("is-idle", "is-route", "is-off");
-    h.el.classList.add(`is-${mode}`);
-    if (mode === "route") {
-      // Re-phase so every route hold pulses in unison (they're invisible right now, so no pop).
-      h.route.getAnimations?.().forEach((a) => { a.currentTime = 0; });
-    }
+    h.idle.classList.toggle("lit", mode === "idle");
+    h.route.classList.toggle("lit", mode === "route");
     if (mode === "off" && !quiet && (prev === "idle" || prev === "route")) {
-      h.el.classList.remove("pulse-away");
-      void h.el.getBoundingClientRect(); // restart the one-shot if it was mid-run
-      h.el.classList.add("pulse-away");
+      const el = prev === "idle" ? h.idle : null; // the swell is drawn on the idle shape
+      if (el) {
+        el.classList.remove("pulse-away");
+        void el.getBoundingClientRect(); // restart the one-shot if it was mid-run
+        el.classList.add("pulse-away");
+      }
     }
     h.mode = mode;
   }
@@ -216,23 +202,23 @@
   function retire(h) {
     setMode(h, "off");
     if (h.removeTimer) return;
-    h.removeTimer = setTimeout(() => { h.el.remove(); holds.delete(h.id); }, REMOVE_AFTER_MS);
+    h.removeTimer = setTimeout(() => { h.idle.remove(); h.route.remove(); holds.delete(h.id); }, REMOVE_AFTER_MS);
   }
 
   // ---------- states ----------
   function setStageSpace(aspect) {
     // Calibrated: projector output space, stretched to fill the screen (same as CastView).
     // Uncalibrated fallback: wall photo letterboxed at its own aspect, holds drawn over it.
-    if (aspect) {
-      stage.setAttribute("viewBox", `0 0 ${aspect} 1`);
-      stage.setAttribute("preserveAspectRatio", "xMidYMid meet");
-      photo.setAttribute("width", aspect);
-      wall.setAttribute("transform", `scale(${aspect} 1)`);
-    } else {
-      stage.setAttribute("viewBox", "0 0 1 1");
-      stage.setAttribute("preserveAspectRatio", "none");
-      wall.removeAttribute("transform");
+    // All three stacked SVGs must share the same space or the layers drift apart.
+    for (const el of document.querySelectorAll(".stage")) {
+      el.setAttribute("viewBox", aspect ? `0 0 ${aspect} 1` : "0 0 1 1");
+      el.setAttribute("preserveAspectRatio", aspect ? "xMidYMid meet" : "none");
     }
+    for (const el of document.querySelectorAll(".space")) {
+      if (aspect) el.setAttribute("transform", `scale(${aspect} 1)`);
+      else el.removeAttribute("transform");
+    }
+    if (aspect) photo.setAttribute("width", aspect);
   }
 
   function showWall(msg) {
